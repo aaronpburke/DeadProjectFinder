@@ -7,6 +7,7 @@
 ## Usage
   DeadProjectFinder [options]
 
+```
 Options:
   --sourceRoot <sourceRoot> (REQUIRED)    Root directory of source tree to analyze
   --projectFile <projectFile> (REQUIRED)  Project file to analyze
@@ -16,3 +17,4 @@ Options:
                                           root directory [default: True]
   --version                               Show version information
   -?, -h, --help                          Show help and usage information
+```
