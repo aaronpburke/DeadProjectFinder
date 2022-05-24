@@ -167,7 +167,12 @@ namespace DeadProjectFinder
                 var projectFiles = GetRecursiveFiles("*.csproj")
                     .Concat(GetRecursiveFiles("*.vcxproj"))
                     .Concat(GetRecursiveFiles("*.bproj"));
-                var unreferencedProjectFiles = projectFiles.Except(_globalReferenceCount.Keys, StringComparer.OrdinalIgnoreCase).ToList();
+                var unreferencedProjectFiles = projectFiles
+                    // all project files except those we found references to
+                    .Except(_globalReferenceCount.Keys
+                        // don't include the analyzed project as unreferenced
+                        .Append(Path.GetRelativePath(rootPath, projectPath)), 
+                    StringComparer.OrdinalIgnoreCase).ToList();
                 Console.WriteLine($"{unreferencedProjectFiles.Count} unreferenced project files found:");
                 foreach (var unrootedPath in unreferencedProjectFiles.OrderBy(path => path))
                 {
