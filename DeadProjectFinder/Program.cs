@@ -36,6 +36,8 @@ namespace DeadProjectFinder
         static readonly ConcurrentDictionary<string, int> _globalReferenceCount = new ConcurrentDictionary<string, int>(comparer: StringComparer.OrdinalIgnoreCase);
         static readonly HashSet<string> _gitSubmodulePaths = new HashSet<string>(comparer: StringComparer.OrdinalIgnoreCase);
 
+        static bool _enableFileCaching = true;
+
         static Task<int> Main(string[] args)
         {
             var rootCommand = new RootCommand("DeadProjectFinder recursively scans project references within a source folder, counting dependencies and optionally reporting unreferenced (i.e., \"dead\") projects.");
@@ -56,13 +58,13 @@ namespace DeadProjectFinder
                 }
             });
             rootCommand.AddOption(sourceRootOption);
-            
+
             var projectFileOption = new Option<FileInfo>(
                 name: "--projectFile",
                 description: "Project file to analyze")
             {
                 IsRequired = true,
-                Arity = ArgumentArity.ExactlyOne                
+                Arity = ArgumentArity.ExactlyOne
             };
             projectFileOption.AddValidator((OptionResult result) =>
             {
@@ -94,22 +96,41 @@ namespace DeadProjectFinder
             };
             rootCommand.AddOption(reportUnusedOption);
 
-            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects) => DoWork(projectPath.FullName, sourceRootPath.FullName, reportAllTopLevelProjects, findUnusedProjects),
-                projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption);
+            var enableFileCachingOption = new Option<bool>(
+                name: "--enableFileCaching",
+                description: "Whether to enable file caching for use between tool invocations. Provides significant performance improvement against unchanged project files. " +
+                    "Usually only helpful to disable for debugging purposes.",
+                getDefaultValue: () => true)
+            {
+                IsRequired = false,
+                Arity = ArgumentArity.ZeroOrOne
+            };
+            rootCommand.AddOption(enableFileCachingOption);
+
+            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, bool enableFileCaching) =>
+            {
+                // Set global state
+                _enableFileCaching = enableFileCaching;
+
+                // Setup
+                ReadGitIgnore(sourceRootPath.FullName);
+
+                Console.WriteLine();
+                Console.WriteLine($"Source root path: {sourceRootPath}");
+                Console.WriteLine($"File caching enabled: {_enableFileCaching}");
+                Console.WriteLine($"Reporting all top-level projects in project: {reportAllTopLevelProjects}");
+                Console.WriteLine($"Discovering and reporting unreferenced projects: {findUnusedProjects}");
+                Console.WriteLine($"Getting all recursive project references in {projectPath}...");
+
+                DoWork(projectPath.FullName, sourceRootPath.FullName, reportAllTopLevelProjects, findUnusedProjects);
+            },
+            projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption, enableFileCachingOption);
 
             return rootCommand.InvokeAsync(args);
         }
 
         private static void DoWork(string projectPath, string rootPath, bool reportAllTopLevelProjects, bool findUnusedProjects)
         {
-            // Setup
-            ReadGitIgnore(rootPath);
-
-            Console.WriteLine();
-            Console.WriteLine($"Source root path: {rootPath}");
-            Console.WriteLine($"Reporting all top-level projects in project: {reportAllTopLevelProjects}");
-            Console.WriteLine($"Discovering and reporting unreferenced projects: {findUnusedProjects}");
-            Console.WriteLine($"Getting all recursive project references in {projectPath}...");
             var globalStopwatch = Stopwatch.StartNew();
             var results = GetProjectDependencies(Path.Combine(rootPath, projectPath));
 
@@ -171,7 +192,7 @@ namespace DeadProjectFinder
                     // all project files except those we found references to
                     .Except(_globalReferenceCount.Keys
                         // don't include the analyzed project as unreferenced
-                        .Append(Path.GetRelativePath(rootPath, projectPath)), 
+                        .Append(Path.GetRelativePath(rootPath, projectPath)),
                     StringComparer.OrdinalIgnoreCase).ToList();
                 Console.WriteLine($"{unreferencedProjectFiles.Count} unreferenced project files found:");
                 foreach (var unrootedPath in unreferencedProjectFiles.OrderBy(path => path))
@@ -247,16 +268,36 @@ namespace DeadProjectFinder
         {
             // Get the cached object from in-memory if we've already analyzed it this process run;
             // otherwise, get it from disk cache if we have it
-            return _inMemoryCache.GetOrAdd(projectFile, (file) => GetFromFileCache(file));
+            return _inMemoryCache.GetOrAdd(projectFile, (file) =>
+            {
+                IEnumerable<ProjectReference> projectReferences;
+                if (_enableFileCaching && TryGetFromFileCache(file, out projectReferences))
+                {
+                    return projectReferences;
+                }
+
+                projectReferences = BuildReferenceList(projectFile).ToList();
+
+                if (_enableFileCaching)
+                {
+                    // serialize to file cache before returning
+                    using (Stream stream = File.Open(GetFileCacheName(projectFile), FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
+                        bformatter.Serialize(stream, projectReferences);
+                    }
+                }
+
+                return projectReferences;
+            });
         }
 
-        static IEnumerable<ProjectReference> GetFromFileCache(string projectFile)
+        static bool TryGetFromFileCache(string projectFile, out IEnumerable<ProjectReference> projectReferences)
         {
             if (!Directory.Exists(".cache"))
                 Directory.CreateDirectory(".cache");
 
-            var md5hash = CalculateMD5(projectFile);
-            var cachedFileName = Path.Combine(".cache", $"{Path.GetFileName(projectFile)}.{md5hash}");
+            string cachedFileName = GetFileCacheName(projectFile);
             if (File.Exists(cachedFileName))
             {
                 try
@@ -264,7 +305,8 @@ namespace DeadProjectFinder
                     // deserialize
                     using Stream stream = File.Open(cachedFileName, FileMode.Open, FileAccess.Read, FileShare.Read);
                     var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                    return (IEnumerable<ProjectReference>)bformatter.Deserialize(stream);
+                    projectReferences = (IEnumerable<ProjectReference>)bformatter.Deserialize(stream);
+                    return true;
                 }
                 catch (FileNotFoundException)
                 {
@@ -276,18 +318,20 @@ namespace DeadProjectFinder
                     File.Delete(cachedFileName);
                 }
             }
+            projectReferences = Enumerable.Empty<ProjectReference>();
+            return false;
+        }
 
+        private static string GetFileCacheName(string projectFile)
+        {
+            var md5hash = CalculateMD5(projectFile);
+            return Path.Combine(".cache", $"{Path.GetFileName(projectFile)}.{md5hash}");
+        }
+
+        private static IEnumerable<ProjectReference> BuildReferenceList(string projectFile)
+        {
             var analyzerResults = _analyzerManager.GetProject(projectFile).Build();
-            var results = analyzerResults.Select(result => new ProjectReference(result)).ToList();
-
-            // serialize to file cache before returning
-            using (Stream stream = File.Open(cachedFileName, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                bformatter.Serialize(stream, results);
-            }
-
-            return results;
+            return analyzerResults.Select(result => new ProjectReference(result));
         }
 
         static string CalculateMD5(string filename)
