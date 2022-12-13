@@ -34,7 +34,7 @@ namespace DeadProjectFinder
         });
         static readonly ConcurrentDictionary<string, IEnumerable<ProjectReference>> _inMemoryCache = new ConcurrentDictionary<string, IEnumerable<ProjectReference>>(comparer: StringComparer.OrdinalIgnoreCase);
         static readonly ConcurrentDictionary<string, int> _globalReferenceCount = new ConcurrentDictionary<string, int>(comparer: StringComparer.OrdinalIgnoreCase);
-        static readonly HashSet<string> _gitSubmodulePaths = new HashSet<string>(comparer: StringComparer.OrdinalIgnoreCase);
+        static readonly HashSet<string> ignorePaths = new HashSet<string>(comparer: StringComparer.OrdinalIgnoreCase);
 
         static bool _enableFileCaching = true;
 
@@ -96,6 +96,16 @@ namespace DeadProjectFinder
             };
             rootCommand.AddOption(reportUnusedOption);
 
+            var ignorePathsOption = new Option<List<string>>(
+                name: "--ignorePath",
+                description: "Specifies a path to ignore (relative to --sourceRoot) for dependency analysis.",
+                getDefaultValue: () => null)
+            {
+                IsRequired = false,
+                Arity = ArgumentArity.ZeroOrMore
+            };
+            rootCommand.AddOption(ignorePathsOption);
+
             var enableFileCachingOption = new Option<bool>(
                 name: "--enableFileCaching",
                 description: "Whether to enable file caching for use between tool invocations. Provides significant performance improvement against unchanged project files. " +
@@ -107,7 +117,7 @@ namespace DeadProjectFinder
             };
             rootCommand.AddOption(enableFileCachingOption);
 
-            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, bool enableFileCaching) =>
+            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, List<string> pathsToIgnore, bool enableFileCaching) =>
             {
                 // Set global state
                 _enableFileCaching = enableFileCaching;
@@ -120,11 +130,20 @@ namespace DeadProjectFinder
                 Console.WriteLine($"File caching enabled: {_enableFileCaching}");
                 Console.WriteLine($"Reporting all top-level projects in project: {reportAllTopLevelProjects}");
                 Console.WriteLine($"Discovering and reporting unreferenced projects: {findUnusedProjects}");
-                Console.WriteLine($"Getting all recursive project references in {projectPath}...");
+                if (pathsToIgnore.Count > 0)
+                {
+                    Console.WriteLine($"Ignoring paths: {string.Join(",", pathsToIgnore)}");
+                }
+                
+                foreach(var ignorePath in pathsToIgnore)
+                {
+                    ignorePaths.Add(ignorePath);
+                }
 
+                Console.WriteLine($"Getting all recursive references in {projectPath}...");
                 DoWork(projectPath.FullName, sourceRootPath.FullName, reportAllTopLevelProjects, findUnusedProjects);
             },
-            projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption, enableFileCachingOption);
+            projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption, ignorePathsOption, enableFileCachingOption);
 
             return rootCommand.InvokeAsync(args);
         }
@@ -160,6 +179,7 @@ namespace DeadProjectFinder
                         {
                             Console.WriteLine(new string(' ', IndentLevel * 2) + "- " + ProjectFile);
                         }
+
                         Console.WriteLine($"# Recursive project dependencies:");
                         foreach (var projectReference in projectReferences.Where(item => item.IndentLevel > 0).GroupBy(item => item.ProjectFile))
                         {
@@ -189,7 +209,9 @@ namespace DeadProjectFinder
                     .Concat(GetRecursiveFiles("*.vcxproj"))
                     .Concat(GetRecursiveFiles("*.bproj"));
                 var unreferencedProjectFiles = projectFiles
-                    // all project files except those we found references to
+                    // except those we're explicitly ignoring
+                    .Where(p => !IgnoreProject(p))
+                    // except those we found references to
                     .Except(_globalReferenceCount.Keys
                         // don't include the analyzed project as unreferenced
                         .Append(Path.GetRelativePath(rootPath, projectPath)),
@@ -214,6 +236,7 @@ namespace DeadProjectFinder
 
             void GetReferences(string projectFile, List<(int, string)> projectReferences, int indentLevel)
             {
+                //projectFile = Environment.ExpandEnvironmentVariables(projectFile);
                 if (!File.Exists(projectFile))
                 {
                     Console.Error.WriteLine($"*** {projectFile} was referenced but does not exist!");
@@ -236,7 +259,7 @@ namespace DeadProjectFinder
 
         private static bool IgnoreProject(string path)
         {
-            return _gitSubmodulePaths.SingleOrDefault(submodulePath => path.StartsWith(submodulePath)) != null;
+            return ignorePaths.SingleOrDefault(submodulePath => path.StartsWith(submodulePath)) != null;
         }
 
         private static void ReadGitIgnore(string rootPath)
@@ -256,7 +279,7 @@ namespace DeadProjectFinder
                             if (Directory.Exists(Path.Combine(rootPath, relativePath)))
                             {
                                 Console.WriteLine($"Adding Git submodule path {relativePath} to ignore list");
-                                _gitSubmodulePaths.Add(relativePath);
+                                ignorePaths.Add(relativePath);
                             }
                         }
                     }
@@ -281,10 +304,18 @@ namespace DeadProjectFinder
                 if (_enableFileCaching)
                 {
                     // serialize to file cache before returning
-                    using (Stream stream = File.Open(GetFileCacheName(projectFile), FileMode.Create, FileAccess.Write, FileShare.None))
+                    try
                     {
-                        var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                        bformatter.Serialize(stream, projectReferences);
+                        using (Stream stream = File.Open(GetFileCacheName(projectFile), FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                        {
+                            var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
+                            bformatter.Serialize(stream, projectReferences);
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        // another thread already created the file, so recursively retry 
+                        return GetProjectDependencies(projectFile);
                     }
                 }
 
