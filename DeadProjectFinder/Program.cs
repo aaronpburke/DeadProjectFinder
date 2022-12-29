@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.CommandLine;
 using System.CommandLine.Parsing;
 using System.Diagnostics;
@@ -14,15 +15,17 @@ using Buildalyzer;
 namespace DeadProjectFinder
 {
     [Serializable]
-    public class ProjectReference
+    public class ProjectAnalysisResults
     {
         public string FilePath { get; set; }
         public List<string> ProjectReferences { get; set; }
+        public List<string> PackageReferences { get; set; }
 
-        public ProjectReference(IAnalyzerResult analyzerResult)
+        public ProjectAnalysisResults(IAnalyzerResult analyzerResult)
         {
             this.FilePath = analyzerResult.ProjectFilePath;
             this.ProjectReferences = analyzerResult.ProjectReferences.ToList();
+            this.PackageReferences = analyzerResult.PackageReferences.Keys.ToList();
         }
     }
 
@@ -32,9 +35,10 @@ namespace DeadProjectFinder
         {
             ProjectFilter = (proj => !IgnoreProject(proj.RelativePath))
         });
-        static readonly ConcurrentDictionary<string, IEnumerable<ProjectReference>> _inMemoryCache = new ConcurrentDictionary<string, IEnumerable<ProjectReference>>(comparer: StringComparer.OrdinalIgnoreCase);
-        static readonly ConcurrentDictionary<string, int> _globalReferenceCount = new ConcurrentDictionary<string, int>(comparer: StringComparer.OrdinalIgnoreCase);
-        static readonly HashSet<string> ignorePaths = new HashSet<string>(comparer: StringComparer.OrdinalIgnoreCase);
+        static readonly ConcurrentDictionary<string, IEnumerable<ProjectAnalysisResults>> _inMemoryCache = new ConcurrentDictionary<string, IEnumerable<ProjectAnalysisResults>>(comparer: StringComparer.OrdinalIgnoreCase);
+        static readonly ConcurrentDictionary<string, int> _globalProjectReferenceCount = new ConcurrentDictionary<string, int>(comparer: StringComparer.OrdinalIgnoreCase);
+		static readonly ConcurrentDictionary<string, int> _globalPackageReferenceCount = new ConcurrentDictionary<string, int>(comparer: StringComparer.OrdinalIgnoreCase);
+		static readonly HashSet<string> ignorePaths = new HashSet<string>(comparer: StringComparer.OrdinalIgnoreCase);
 
         static bool _enableFileCaching = true;
 
@@ -87,7 +91,7 @@ namespace DeadProjectFinder
             rootCommand.AddOption(reportTopLevelProjectsOption);
 
             var reportUnusedOption = new Option<bool>(
-                name: "--reportUnused",
+                name: "--reportUnusedProjects",
                 description: "Whether to scan for and report unused projects starting from the source code root directory",
                 getDefaultValue: () => true)
             {
@@ -96,7 +100,17 @@ namespace DeadProjectFinder
             };
             rootCommand.AddOption(reportUnusedOption);
 
-            var ignorePathsOption = new Option<List<string>>(
+			var packagesListFileOption = new Option<string>(
+				name: "--packageListFile",
+				description: "Whether to scan for and report unused packages defined in the project file of this argument.",
+				getDefaultValue: () => string.Empty)
+			{
+				IsRequired = false,
+				Arity = ArgumentArity.ExactlyOne
+			};
+			rootCommand.AddOption(packagesListFileOption);
+
+			var ignorePathsOption = new Option<List<string>>(
                 name: "--ignorePath",
                 description: "Specifies a path to ignore (relative to --sourceRoot) for dependency analysis.",
                 getDefaultValue: () => null)
@@ -117,7 +131,7 @@ namespace DeadProjectFinder
             };
             rootCommand.AddOption(enableFileCachingOption);
 
-            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, List<string> pathsToIgnore, bool enableFileCaching) =>
+            rootCommand.SetHandler((FileInfo projectPath, DirectoryInfo sourceRootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, string packagesListFile, List<string> pathsToIgnore, bool enableFileCaching) =>
             {
                 // Set global state
                 _enableFileCaching = enableFileCaching;
@@ -130,7 +144,19 @@ namespace DeadProjectFinder
                 Console.WriteLine($"File caching enabled: {_enableFileCaching}");
                 Console.WriteLine($"Reporting all top-level projects in project: {reportAllTopLevelProjects}");
                 Console.WriteLine($"Discovering and reporting unreferenced projects: {findUnusedProjects}");
-                if (pathsToIgnore.Count > 0)
+                if (!string.IsNullOrEmpty(packagesListFile))
+                {
+                    if (File.Exists(packagesListFile))
+					{
+						Console.WriteLine($"Discovering and reporting unreferenced packages from file: {packagesListFile}");
+					}
+                    else
+                    {
+                        Console.WriteLine($"Package list file {packagesListFile} does not exist or cannot be read");
+                        packagesListFile = string.Empty;
+                    }
+                }
+				if (pathsToIgnore.Count > 0)
                 {
                     Console.WriteLine($"Ignoring paths: {string.Join(",", pathsToIgnore)}");
                 }
@@ -141,17 +167,17 @@ namespace DeadProjectFinder
                 }
 
                 Console.WriteLine($"Getting all recursive references in {projectPath}...");
-                DoWork(projectPath.FullName, sourceRootPath.FullName, reportAllTopLevelProjects, findUnusedProjects);
+                DoWork(projectPath.FullName, sourceRootPath.FullName, reportAllTopLevelProjects, findUnusedProjects, packagesListFile);
             },
-            projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption, ignorePathsOption, enableFileCachingOption);
+            projectFileOption, sourceRootOption, reportTopLevelProjectsOption, reportUnusedOption, packagesListFileOption, ignorePathsOption, enableFileCachingOption);
 
             return rootCommand.InvokeAsync(args);
         }
 
-        private static void DoWork(string projectPath, string rootPath, bool reportAllTopLevelProjects, bool findUnusedProjects)
+        private static void DoWork(string projectPath, string rootPath, bool reportAllTopLevelProjects, bool findUnusedProjects, string packagesListFile)
         {
             var globalStopwatch = Stopwatch.StartNew();
-            var results = GetProjectDependencies(Path.Combine(rootPath, projectPath));
+            var results = AnalyzeProject(Path.Combine(rootPath, projectPath));
 
             var consoleLock = new object();
             Parallel.ForEach(results.First().ProjectReferences, (topLevelProject) =>
@@ -159,12 +185,17 @@ namespace DeadProjectFinder
                 var projectStopwatch = Stopwatch.StartNew();
 
                 var projectReferences = new List<(int IndentLevel, string ProjectFile)>();
-                GetReferences(topLevelProject, projectReferences, 0);
+				var packageReferences = new List<(int IndentLevel, string Package)>();
+				GetReferences(topLevelProject, projectReferences, packageReferences, 0);
                 foreach (var (IndentLevel, ProjectFile) in projectReferences)
                 {
-                    _globalReferenceCount.AddOrUpdate(ProjectFile, 1, (p, c) => c + 1);
-                }
-                projectStopwatch.Stop();
+                    _globalProjectReferenceCount.AddOrUpdate(ProjectFile, 1, (p, c) => c + 1);
+				}
+				foreach (var (IndentLevel, PackageName) in packageReferences)
+				{
+					_globalPackageReferenceCount.AddOrUpdate(PackageName, 1, (p, c) => c + 1);
+				}
+				projectStopwatch.Stop();
 
                 if (reportAllTopLevelProjects)
                 {
@@ -173,19 +204,30 @@ namespace DeadProjectFinder
                         Console.WriteLine("===========================");
                         Console.WriteLine($"# {Path.GetFileName(topLevelProject)}");
                         Console.WriteLine($"# Analysis completed in {projectStopwatch.ElapsedMilliseconds} ms.");
-                        Console.WriteLine($"# Dependency tree:");
+                        Console.WriteLine($"# Project dependency tree:");
 
                         foreach (var (IndentLevel, ProjectFile) in projectReferences)
                         {
                             Console.WriteLine(new string(' ', IndentLevel * 2) + "- " + ProjectFile);
-                        }
+						}
+						Console.WriteLine($"# Package references:");
+						foreach (var (IndentLevel, PackageName) in packageReferences.Where(packageReference => packageReference.IndentLevel == 0))
+						{
+							Console.WriteLine(new string(' ', IndentLevel * 2) + "- " + PackageName);
+						}
 
-                        Console.WriteLine($"# Recursive project dependencies:");
+						Console.WriteLine($"# Recursive project dependencies:");
                         foreach (var projectReference in projectReferences.Where(item => item.IndentLevel > 0).GroupBy(item => item.ProjectFile))
                         {
                             Console.WriteLine($"# - {projectReference.Key} ({projectReference.Count()} recursive references)");
-                        }
-                    }
+						}
+
+						Console.WriteLine($"# Recursive package references:");
+						foreach (var packageReference in packageReferences.Where(item => item.IndentLevel > 0).GroupBy(item => item.Package))
+						{
+							Console.WriteLine($"# - {packageReference.Key} ({packageReference.Count()} recursive references)");
+						}
+					}
                 }
             });
             globalStopwatch.Stop();
@@ -193,12 +235,20 @@ namespace DeadProjectFinder
             Console.WriteLine();
             Console.WriteLine("===========================");
             Console.WriteLine("Globally referenced projects:");
-            foreach (var projectReference in _globalReferenceCount.OrderBy(kvp => kvp.Key))
+            foreach (var projectReference in _globalProjectReferenceCount.OrderBy(kvp => kvp.Key))
             {
                 Console.WriteLine($" - {projectReference.Key} ({projectReference.Value} recursive references)");
-            }
+			}
 
-            Console.WriteLine();
+			Console.WriteLine();
+			Console.WriteLine("===========================");
+			Console.WriteLine("Globally referenced packages:");
+			foreach (var packageReference in _globalPackageReferenceCount.OrderBy(kvp => kvp.Key))
+			{
+				Console.WriteLine($" - {packageReference.Key} ({packageReference.Value} recursive references)");
+			}
+
+			Console.WriteLine();
             Console.WriteLine($"Global analysis completed in {globalStopwatch.ElapsedMilliseconds} ms.");
 
             if (findUnusedProjects)
@@ -212,7 +262,7 @@ namespace DeadProjectFinder
                     // except those we're explicitly ignoring
                     .Where(p => !IgnoreProject(p))
                     // except those we found references to
-                    .Except(_globalReferenceCount.Keys
+                    .Except(_globalProjectReferenceCount.Keys
                         // don't include the analyzed project as unreferenced
                         .Append(Path.GetRelativePath(rootPath, projectPath)),
                     StringComparer.OrdinalIgnoreCase).ToList();
@@ -234,7 +284,24 @@ namespace DeadProjectFinder
                 }
             }
 
-            void GetReferences(string projectFile, List<(int, string)> projectReferences, int indentLevel)
+			if (!string.IsNullOrWhiteSpace(packagesListFile))
+			{
+				Console.WriteLine();
+				Console.WriteLine("Finding unreferenced packages...");
+				var packagesList = _analyzerManager.GetProject(packagesListFile).ProjectFile.PackageReferences.Select(reference => reference.Name);
+				var unreferencedPackages = packagesList
+					// except those we found references to
+					.Except(_globalPackageReferenceCount.Keys,
+					StringComparer.OrdinalIgnoreCase).ToList();
+				Console.WriteLine($"{unreferencedPackages.Count} unreferenced packages found:");
+				foreach (var packageName in unreferencedPackages.OrderBy(name => name))
+				{
+					Console.WriteLine($" - {packageName}");
+				}
+				Console.WriteLine();
+			}
+
+			void GetReferences(string projectFile, List<(int, string)> projectReferences, List<(int, string)> packageReferences, int indentLevel)
             {
                 //projectFile = Environment.ExpandEnvironmentVariables(projectFile);
                 if (!File.Exists(projectFile))
@@ -243,7 +310,7 @@ namespace DeadProjectFinder
                     return;
                 }
 
-                foreach (var project in GetProjectDependencies(projectFile))
+                foreach (var project in AnalyzeProject(projectFile))
                 {
                     string unrootedPath = Path.GetRelativePath(rootPath, project.FilePath);
                     projectReferences.Add((indentLevel, unrootedPath));
@@ -251,8 +318,13 @@ namespace DeadProjectFinder
                     foreach (var projectRef in project.ProjectReferences)
                     {
                         // Increment project-local reference count for this project dependency, then recurse into it
-                        GetReferences(projectRef, projectReferences, indentLevel + 1);
+                        GetReferences(projectRef, projectReferences, packageReferences, indentLevel + 1);
                     };
+
+                    foreach (var packageReference in project.PackageReferences)
+                    {
+                        packageReferences.Add((indentLevel, packageReference));
+                    }
                 }
             }
         }
@@ -287,13 +359,13 @@ namespace DeadProjectFinder
             }
         }
 
-        static IEnumerable<ProjectReference> GetProjectDependencies(string projectFile)
+        static IEnumerable<ProjectAnalysisResults> AnalyzeProject(string projectFile)
         {
             // Get the cached object from in-memory if we've already analyzed it this process run;
             // otherwise, get it from disk cache if we have it
             return _inMemoryCache.GetOrAdd(projectFile, (file) =>
             {
-                IEnumerable<ProjectReference> projectReferences;
+                IEnumerable<ProjectAnalysisResults> projectReferences;
                 if (_enableFileCaching && TryGetFromFileCache(file, out projectReferences))
                 {
                     return projectReferences;
@@ -315,7 +387,7 @@ namespace DeadProjectFinder
                     catch (IOException)
                     {
                         // another thread already created the file, so recursively retry 
-                        return GetProjectDependencies(projectFile);
+                        return AnalyzeProject(projectFile);
                     }
                 }
 
@@ -323,7 +395,7 @@ namespace DeadProjectFinder
             });
         }
 
-        static bool TryGetFromFileCache(string projectFile, out IEnumerable<ProjectReference> projectReferences)
+        static bool TryGetFromFileCache(string projectFile, out IEnumerable<ProjectAnalysisResults> projectReferences)
         {
             if (!Directory.Exists(".cache"))
                 Directory.CreateDirectory(".cache");
@@ -336,7 +408,7 @@ namespace DeadProjectFinder
                     // deserialize
                     using Stream stream = File.Open(cachedFileName, FileMode.Open, FileAccess.Read, FileShare.Read);
                     var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                    projectReferences = (IEnumerable<ProjectReference>)bformatter.Deserialize(stream);
+                    projectReferences = (IEnumerable<ProjectAnalysisResults>)bformatter.Deserialize(stream);
                     return true;
                 }
                 catch (FileNotFoundException)
@@ -349,7 +421,7 @@ namespace DeadProjectFinder
                     File.Delete(cachedFileName);
                 }
             }
-            projectReferences = Enumerable.Empty<ProjectReference>();
+            projectReferences = Enumerable.Empty<ProjectAnalysisResults>();
             return false;
         }
 
@@ -359,10 +431,10 @@ namespace DeadProjectFinder
             return Path.Combine(".cache", $"{Path.GetFileName(projectFile)}.{md5hash}");
         }
 
-        private static IEnumerable<ProjectReference> BuildReferenceList(string projectFile)
+        private static IEnumerable<ProjectAnalysisResults> BuildReferenceList(string projectFile)
         {
             var analyzerResults = _analyzerManager.GetProject(projectFile).Build();
-            return analyzerResults.Select(result => new ProjectReference(result));
+            return analyzerResults.Select(result => new ProjectAnalysisResults(result));
         }
 
         static string CalculateMD5(string filename)
