@@ -1,25 +1,35 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.CommandLine;
 using System.CommandLine.Parsing;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.Serialization;
 using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Buildalyzer;
 
 namespace DeadProjectFinder
 {
-    [Serializable]
+    [JsonSerializable(typeof(ProjectAnalysisResults))]
     public class ProjectAnalysisResults
     {
         public string FilePath { get; set; }
         public List<string> ProjectReferences { get; set; }
         public List<string> PackageReferences { get; set; }
+
+        /// <summary>
+        /// Default constructor for deserialization purposes.
+        /// </summary>
+        public ProjectAnalysisResults()
+        {
+            this.FilePath = string.Empty;
+            this.ProjectReferences = new List<string>();
+            this.PackageReferences = new List<string>();
+        }
 
         public ProjectAnalysisResults(IAnalyzerResult analyzerResult)
         {
@@ -378,15 +388,15 @@ namespace DeadProjectFinder
                     // serialize to file cache before returning
                     try
                     {
-                        using (Stream stream = File.Open(GetFileCacheName(projectFile), FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                        string json = JsonSerializer.Serialize(projectReferences, new JsonSerializerOptions
                         {
-                            var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                            bformatter.Serialize(stream, projectReferences);
-                        }
+                            WriteIndented = true
+                        });
+                        File.WriteAllText(GetFileCacheName(projectFile), json);
                     }
                     catch (IOException)
                     {
-                        // another thread already created the file, so recursively retry 
+                        // Another thread already created the file, so recursively retry
                         return AnalyzeProject(projectFile);
                     }
                 }
@@ -405,19 +415,21 @@ namespace DeadProjectFinder
             {
                 try
                 {
-                    // deserialize
-                    using Stream stream = File.Open(cachedFileName, FileMode.Open, FileAccess.Read, FileShare.Read);
-                    var bformatter = new System.Runtime.Serialization.Formatters.Binary.BinaryFormatter();
-                    projectReferences = (IEnumerable<ProjectAnalysisResults>)bformatter.Deserialize(stream);
+                    // Deserialize
+                    string json = File.ReadAllText(cachedFileName);
+                    projectReferences = JsonSerializer.Deserialize<IEnumerable<ProjectAnalysisResults>>(json, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
                     return true;
                 }
                 catch (FileNotFoundException)
                 {
-                    // do nothing
+                    // Do nothing
                 }
-                // bad serialization format, delete it from file cache and continue processing                    
-                catch (SerializationException)
+                catch (JsonException)
                 {
+                    // Bad serialization format, delete it from file cache and continue processing
                     File.Delete(cachedFileName);
                 }
             }
